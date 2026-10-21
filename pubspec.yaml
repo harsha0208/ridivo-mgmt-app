@@ -1,0 +1,35 @@
+name: event_management
+description: Ridivo event management app — check-in and timing via venue JWT.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  dio: ^5.7.0
+  flutter_secure_storage: ^9.2.2
+  shared_preferences: ^2.3.3
+  flutter_riverpod: ^2.6.1
+  mobile_scanner: ^6.0.2
+  flutter_svg: ^2.0.10+1
+  google_fonts: ^6.2.1
+  package_info_plus: ^9.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icons/
+
+  # flutter_secure_storage / mobile_scanner do not support SwiftPM yet —
+  # CocoaPods avoids "No Xcode build settings have been found" on device builds.
+  config:
+    enable-swift-package-manager: false
