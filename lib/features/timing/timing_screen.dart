@@ -27,6 +27,7 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
   TimingGroupsState _state = TimingGroupsState.empty();
   bool _loading = false;
   bool _scanning = false;
+  bool _handlingScan = false;
   String _scanSlot = 'current';
   String? _loadedEventId;
   Timer? _tick;
@@ -62,19 +63,40 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
   }
 
   void _syncTick() {
-    final running = _state.current?.members.any(
-          (m) => m.status == MemberStatus.running,
-        ) ??
-        false;
+    final running = !_scanning &&
+        (_state.current?.members.any(
+              (m) => m.status == MemberStatus.running,
+            ) ??
+            false);
     if (running && _tick == null) {
       _tick = Timer.periodic(const Duration(milliseconds: 100), (_) {
-        if (!mounted) return;
+        if (!mounted || _scanning) return;
         setState(() => _nowMs = DateTime.now().millisecondsSinceEpoch);
       });
     } else if (!running && _tick != null) {
       _tick?.cancel();
       _tick = null;
     }
+  }
+
+  void _openScanner(String slot) {
+    setState(() {
+      _scanSlot = slot;
+      _scanning = true;
+      _handlingScan = false;
+    });
+    // Pause live ticker — MobileScanner crashes if rebuilt every 100ms.
+    _syncTick();
+  }
+
+  void _closeScanner() {
+    if (!_scanning) return;
+    setState(() {
+      _scanning = false;
+      _handlingScan = false;
+      _nowMs = DateTime.now().millisecondsSinceEpoch;
+    });
+    _syncTick();
   }
 
   Future<void> _search() async {
@@ -139,23 +161,28 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
   Future<void> _scanToSlot(String token, String slot) async {
     final eventId = _eventId;
     if (eventId == null || token.trim().isEmpty) return;
+    if (_handlingScan) return;
+    _handlingScan = true;
     setState(() {
       _loading = true;
       _scanning = false;
     });
+    _syncTick();
     try {
       final result = await ref
           .read(dioFactoryProvider)
           .api
           .resolveQR(eventId, token.trim());
+      if (!mounted) return;
       if (result.result != 'valid' || result.ticket == null) {
         _toast(result.message ?? result.result);
         return;
       }
       await _addTo(result.ticket!, slot);
     } catch (e) {
-      _toast(_err(e));
+      if (mounted) _toast(_err(e));
     } finally {
+      _handlingScan = false;
       if (mounted) setState(() => _loading = false);
     }
   }
@@ -218,6 +245,8 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
       }
       if (g.allDone) g.status = GroupStatus.review;
     });
+    // Stop the 100ms ticker before review UI builds TextFields.
+    _syncTick();
     await _persist();
   }
 
@@ -238,6 +267,7 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
       }
       if (g.allDone) g.status = GroupStatus.review;
     });
+    _syncTick();
     await _persist();
   }
 
@@ -377,9 +407,21 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
     if (_scanning) {
       return Column(
         children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Text(
+              _scanSlot == 'next'
+                  ? 'Scan ticket → Next group'
+                  : 'Scan ticket → Current group',
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+          ),
           Expanded(
             child: MobileScanner(
+              // Stable key so parent rebuilds don't recreate the camera.
+              key: ValueKey('timing-scanner-$_scanSlot'),
               onDetect: (capture) {
+                if (_handlingScan || _loading) return;
                 if (capture.barcodes.isEmpty) return;
                 final value = capture.barcodes.first.rawValue;
                 if (value != null && value.isNotEmpty) {
@@ -391,7 +433,7 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
           Padding(
             padding: const EdgeInsets.all(16),
             child: OutlinedButton(
-              onPressed: () => setState(() => _scanning = false),
+              onPressed: _closeScanner,
               child: const Text('Close scanner'),
             ),
           ),
@@ -418,10 +460,7 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
               child: FilledButton.icon(
                 onPressed: _loading || inReview
                     ? null
-                    : () => setState(() {
-                          _scanSlot = 'current';
-                          _scanning = true;
-                        }),
+                    : () => _openScanner('current'),
                 icon: const Icon(Icons.qr_code_scanner),
                 label: const Text('Scan → Current'),
               ),
@@ -429,12 +468,7 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
             const SizedBox(width: 8),
             Expanded(
               child: OutlinedButton.icon(
-                onPressed: _loading
-                    ? null
-                    : () => setState(() {
-                          _scanSlot = 'next';
-                          _scanning = true;
-                        }),
+                onPressed: _loading ? null : () => _openScanner('next'),
                 icon: const Icon(Icons.qr_code_scanner),
                 label: const Text('Scan → Next'),
               ),
@@ -465,22 +499,26 @@ class _TimingScreenState extends ConsumerState<TimingScreen> {
                 'Laps ${t.lapsIncluded} · ${t.holderName ?? '—'}'
                 '${where != null ? ' · in $where' : ''}',
               ),
-              trailing: Wrap(
-                spacing: 4,
-                children: [
-                  TextButton(
-                    onPressed: _loading || where != null || inReview
-                        ? null
-                        : () => _addTo(t, 'current'),
-                    child: const Text('Current'),
-                  ),
-                  TextButton(
-                    onPressed: _loading || where != null
-                        ? null
-                        : () => _addTo(t, 'next'),
-                    child: const Text('Next'),
-                  ),
-                ],
+              trailing: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerRight,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextButton(
+                      onPressed: _loading || where != null || inReview
+                          ? null
+                          : () => _addTo(t, 'current'),
+                      child: const Text('Current'),
+                    ),
+                    TextButton(
+                      onPressed: _loading || where != null
+                          ? null
+                          : () => _addTo(t, 'next'),
+                      child: const Text('Next'),
+                    ),
+                  ],
+                ),
               ),
             ),
           );
@@ -573,6 +611,7 @@ class _GroupCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
                   child: Text(
@@ -580,29 +619,41 @@ class _GroupCard extends StatelessWidget {
                     style: Theme.of(context).textTheme.titleSmall,
                   ),
                 ),
-                if (!stagingOnly && canStartAll)
-                  FilledButton(
-                    onPressed: loading ? null : onStartAll,
-                    child: const Text('Start all'),
-                  ),
-                if (!stagingOnly && inReview) ...[
-                  TextButton(
-                    onPressed: loading || group?.status == GroupStatus.saving
-                        ? null
-                        : onDiscard,
-                    child: const Text('Discard'),
-                  ),
-                  FilledButton(
-                    onPressed: loading || group?.status == GroupStatus.saving
-                        ? null
-                        : onSaveAll,
-                    child: Text(
-                      group?.status == GroupStatus.saving
-                          ? 'Saving…'
-                          : 'Save all',
+                if (!stagingOnly && (canStartAll || inReview))
+                  Flexible(
+                    child: Wrap(
+                      spacing: 4,
+                      runSpacing: 4,
+                      alignment: WrapAlignment.end,
+                      children: [
+                        if (canStartAll)
+                          FilledButton(
+                            onPressed: loading ? null : onStartAll,
+                            child: const Text('Start all'),
+                          ),
+                        if (inReview) ...[
+                          TextButton(
+                            onPressed:
+                                loading || group?.status == GroupStatus.saving
+                                    ? null
+                                    : onDiscard,
+                            child: const Text('Discard'),
+                          ),
+                          FilledButton(
+                            onPressed:
+                                loading || group?.status == GroupStatus.saving
+                                    ? null
+                                    : onSaveAll,
+                            child: Text(
+                              group?.status == GroupStatus.saving
+                                  ? 'Saving…'
+                                  : 'Save all',
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
-                ],
               ],
             ),
             if (group == null || group!.members.isEmpty)
@@ -654,41 +705,45 @@ class _GroupCard extends StatelessWidget {
                               ],
                             ),
                           ),
-                          Wrap(
-                            spacing: 4,
-                            children: [
-                              if (!stagingOnly &&
-                                  !inReview &&
-                                  m.status == MemberStatus.queued)
-                                TextButton(
-                                  onPressed: () => onStartOne(m.ticketId),
-                                  child: const Text('Start'),
-                                ),
-                              if (!stagingOnly &&
-                                  !inReview &&
-                                  m.status == MemberStatus.running) ...[
-                                FilledButton(
-                                  onPressed: () => onFinish(m.ticketId),
-                                  child: const Text('Finish'),
-                                ),
-                                OutlinedButton(
-                                  onPressed: () => onDnf(m.ticketId),
-                                  child: const Text('DNF'),
-                                ),
+                          Flexible(
+                            child: Wrap(
+                              spacing: 4,
+                              runSpacing: 4,
+                              alignment: WrapAlignment.end,
+                              children: [
+                                if (!stagingOnly &&
+                                    !inReview &&
+                                    m.status == MemberStatus.queued)
+                                  TextButton(
+                                    onPressed: () => onStartOne(m.ticketId),
+                                    child: const Text('Start'),
+                                  ),
+                                if (!stagingOnly &&
+                                    !inReview &&
+                                    m.status == MemberStatus.running) ...[
+                                  FilledButton(
+                                    onPressed: () => onFinish(m.ticketId),
+                                    child: const Text('Finish'),
+                                  ),
+                                  OutlinedButton(
+                                    onPressed: () => onDnf(m.ticketId),
+                                    child: const Text('DNF'),
+                                  ),
+                                ],
+                                if (!stagingOnly &&
+                                    !inReview &&
+                                    m.status == MemberStatus.queued)
+                                  TextButton(
+                                    onPressed: () => onDnf(m.ticketId),
+                                    child: const Text('DNF'),
+                                  ),
+                                if (m.status == MemberStatus.queued)
+                                  IconButton(
+                                    icon: const Icon(Icons.close, size: 20),
+                                    onPressed: () => onRemove(m.ticketId),
+                                  ),
                               ],
-                              if (!stagingOnly &&
-                                  !inReview &&
-                                  m.status == MemberStatus.queued)
-                                TextButton(
-                                  onPressed: () => onDnf(m.ticketId),
-                                  child: const Text('DNF'),
-                                ),
-                              if (m.status == MemberStatus.queued)
-                                IconButton(
-                                  icon: const Icon(Icons.close, size: 20),
-                                  onPressed: () => onRemove(m.ticketId),
-                                ),
-                            ],
+                            ),
                           ),
                         ],
                       ),
@@ -696,9 +751,7 @@ class _GroupCard extends StatelessWidget {
                         Padding(
                           padding: const EdgeInsets.only(top: 6),
                           child: _DurationField(
-                            key: ValueKey(
-                              '${m.ticketId}-${m.editedDurationMs ?? m.durationMs}',
-                            ),
+                            key: ValueKey(m.ticketId),
                             initial: formatDurationMs(
                               m.effectiveDurationMs ?? 0,
                             ),
@@ -747,20 +800,17 @@ class _DurationFieldState extends State<_DurationField> {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 140,
-      child: TextField(
-        controller: _controller,
-        decoration: const InputDecoration(
-          isDense: true,
-          labelText: 'Duration (m:ss.s)',
-          border: OutlineInputBorder(),
-        ),
-        style: const TextStyle(fontFamily: 'monospace'),
-        keyboardType: const TextInputType.numberWithOptions(decimal: true),
-        onSubmitted: widget.onCommit,
-        onTapOutside: (_) => widget.onCommit(_controller.text),
+    return TextField(
+      controller: _controller,
+      decoration: const InputDecoration(
+        isDense: true,
+        labelText: 'Duration (m:ss.s)',
+        border: OutlineInputBorder(),
       ),
+      style: const TextStyle(fontFamily: 'monospace'),
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      onSubmitted: widget.onCommit,
+      onEditingComplete: () => widget.onCommit(_controller.text),
     );
   }
 }
